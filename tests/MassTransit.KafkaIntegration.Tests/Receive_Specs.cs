@@ -115,7 +115,8 @@ namespace MassTransit.KafkaIntegration.Tests
         InMemoryTestFixture
     {
         const string Topic = "test-concurrent-keys";
-        const int NumMessages = 10;
+        const int NumMessages = 100;
+        const int ConcurrentMessageLimit = 10;
         const int NumKeys = 2;
 
         [Test]
@@ -140,7 +141,7 @@ namespace MassTransit.KafkaIntegration.Tests
                             k.TopicEndpoint<int, KafkaMessage>(Topic, nameof(ConcurrentKeysReceive_Specs), c =>
                             {
                                 c.AutoOffsetReset = AutoOffsetReset.Earliest;
-                                c.ConcurrentMessageLimit = NumMessages;
+                                c.ConcurrentMessageLimit = ConcurrentMessageLimit;
 
                                 c.ConfigureConsumer<KafkaMessageConsumer>(context);
                             });
@@ -170,6 +171,81 @@ namespace MassTransit.KafkaIntegration.Tests
             }
         }
 
+        [Test]
+        public async Task Should_receive_concurrently_by_keys_with_existing_data()
+        {
+            await InitTopicDataAsync();
+
+            await using var provider = new ServiceCollection()
+                .ConfigureKafkaTestOptions(options =>
+                {
+                    options.CreateTopicsIfNotExists = true;
+                    options.TopicNames = new[] { Topic };
+                })
+                .AddMassTransitTestHarness(x =>
+                {
+                    x.AddTaskCompletionSource<ConsumeContext<KafkaMessage>>();
+                    x.AddRider(rider =>
+                    {
+                        rider.AddConsumer<KafkaMessageConsumer>();
+
+                        rider.UsingKafka((context, k) =>
+                        {
+                            k.TopicEndpoint<int, KafkaMessage>(Topic, nameof(ConcurrentKeysReceive_Specs), c =>
+                            {
+                                c.AutoOffsetReset = AutoOffsetReset.Earliest;
+                                c.ConcurrentMessageLimit = ConcurrentMessageLimit;
+
+                                c.ConfigureConsumer<KafkaMessageConsumer>(context);
+                            });
+                        });
+                    });
+                }).BuildServiceProvider();
+
+            var harness = provider.GetTestHarness();
+            await harness.Start();
+
+            await provider.GetTask<ConsumeContext<KafkaMessage>>();
+
+            IList<IReceivedMessage<KafkaMessage>> receivedMessages = await harness.Consumed.SelectAsync<KafkaMessage>().ToListAsync();
+            Assert.That(receivedMessages.Count, Is.EqualTo(NumMessages));
+            var result = new int[NumKeys];
+
+            foreach (IReceivedMessage<KafkaMessage> receivedMessage in receivedMessages)
+            {
+                ConsumeContext<KafkaMessage> context = receivedMessage.Context;
+                var key = context.GetKey<int>();
+                Assert.That(context.Message.Index, Is.GreaterThan(result[key]));
+                result[key] = context.Message.Index;
+            }
+        }
+
+        static async Task InitTopicDataAsync()
+        {
+            await using var producerProvider = new ServiceCollection()
+                .ConfigureKafkaTestOptions(options =>
+                {
+                    options.CreateTopicsIfNotExists = true;
+                    options.TopicNames = new[] { Topic };
+                    options.CleanTopicsOnStart = true;
+                })
+                .AddMassTransitTestHarness(x =>
+                {
+                    x.AddTaskCompletionSource<ConsumeContext<KafkaMessage>>();
+                    x.AddRider(rider =>
+                    {
+                        rider.AddProducer<int, KafkaMessage>(Topic);
+                        rider.UsingKafka((context, k) => { });
+                    });
+                }).BuildServiceProvider();
+
+            var harness = producerProvider.GetTestHarness();
+            await harness.Start();
+
+            ITopicProducer<int, KafkaMessage> producer = harness.GetProducer<int, KafkaMessage>();
+            for (var i = 0; i < NumMessages; i++)
+                await producer.Produce(i % NumKeys, new { Index = i + 1 }, harness.CancellationToken);
+        }
 
         class KafkaMessageConsumer :
             IConsumer<KafkaMessage>
